@@ -23,35 +23,35 @@ import torch.multiprocessing as mp
 from transformers import AutoModelForCausalLM
 
 from sal.config import Config
-from sal.models.reward_models import load_prm
+from sal.models.reward_models import ScorerRegistry
 from sal.utils.data import get_dataset, save_dataset
 from sal.utils.parser import H4ArgumentParser
 from sal.utils.score import score
-from sal.search import \
-    best_of_n, \
-    best_of_n_conf, \
-    smart_best_of_n, \
-    beam_search, \
-    beam_search_conf, \
-    smart_beam_search, \
-    smart_beam_search_conf, \
-    dvts
+from sal.search import (
+    best_of_n,
+    smart_best_of_n,
+    beam_search,
+    smart_beam_search,
+)
 from datasets import Dataset
+
 logging.basicConfig(level=logging.INFO)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+# ---------------------------------------------------------------------------
+# Approach dispatch table
+# ---------------------------------------------------------------------------
+# Maps the computed approach_name string → the search function to call.
+# Add new approaches here as the project grows.
 APPROACHES = {
-    "beam_search":beam_search,
+    "best_of_n":        best_of_n,
+    "best_of_n_smart":  smart_best_of_n,
+    "beam_search":      beam_search,
     "beam_search_smart": smart_beam_search,
-    "beam_search_conf": beam_search_conf,
-    "beam_search_smart_conf": smart_beam_search_conf,
-    "dvts": dvts,
-    "best_of_n": best_of_n,
-    "best_of_n_smart": smart_best_of_n,
-    "best_of_n_conf": best_of_n_conf,
 }
+
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -59,41 +59,85 @@ def set_seed(seed):
     np.random.seed(seed)
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False  # Disable optimizations for reproducibility
+    torch.backends.cudnn.benchmark = False
 
-set_seed(42) 
+
+set_seed(42)
+
+
+def _build_groq_llm(model_path: str):
+    """
+    Instantiate a GroqClient when model_path has the 'groq:<model>' prefix.
+
+    Example model_path values:
+        groq:llama-3.1-8b-instant
+        groq:llama-3.3-70b-versatile
+    """
+    from sal.utils.groq_client import GroqClient
+    model_name = model_path.split("groq:", 1)[1].strip()
+    if not model_name:
+        model_name = "llama-3.1-8b-instant"
+    logger.info(f"Using Groq instructor LLM: {model_name}")
+    return GroqClient(model=model_name)
+
+
+def _build_hf_llm(model_path: str):
+    """Load a local/HF instructor LLM via HuggingFace transformers."""
+    return AutoModelForCausalLM.from_pretrained(
+        model_path,
+        device_map="auto",
+        torch_dtype=torch.bfloat16,
+    ).eval()
+
 
 def main():
     parser = H4ArgumentParser(Config)
     config = parser.parse()
 
     num_gpus = torch.cuda.device_count()
-    print("="*20)
-    print("The number of available GPUs:", num_gpus)
-    
-    # configure approach name
+    print("=" * 20)
+    print(f"Available GPUs: {num_gpus}")
+
+    # ------------------------------------------------------------------
+    # Resolve approach name
+    # "smart" suffix → SMART pipeline (SLM + instructor LLM)
+    # no suffix     → baseline pipeline (single LLM only)
+    # ------------------------------------------------------------------
     approach_suffix = "_smart" if config.smart_search else ""
-    approach_suffix += "_conf" if config.score_method == 'conf' else ""
     approach_name = config.approach + approach_suffix
-    
+
     if approach_name not in APPROACHES:
-        raise ValueError(f"Invalid score method: {config.score_method}")
+        raise ValueError(
+            f"Unknown approach '{approach_name}'. "
+            f"Available: {list(APPROACHES.keys())}"
+        )
     approach_fn = APPROACHES[approach_name]
-    
-    # log the search method and score method
-    print("\nUsing " + \
-        ("SMART" if config.smart_search else "Baseline") + \
-        " search.\nUsing " + \
-        ("Confidence" if config.score_method == 'conf' else "PRM") + \
-        " based score.\n")
+
+    # ------------------------------------------------------------------
+    # Load scorer via the ScorerRegistry strategy pattern.
+    # New scoring methods can be added by registering them in
+    # reward_models.py — no changes needed here.
+    # ------------------------------------------------------------------
+    scorer = ScorerRegistry.get(config.score_method, config)
+
+    print(
+        f"\nSearch mode : {'SMART' if config.smart_search else 'Baseline'}\n"
+        f"Score method: {config.score_method} (scorer: {type(scorer).__name__})\n"
+        f"Approach    : {approach_name}\n"
+        f"N           : {config.n}\n"
+        f"Beam width  : {config.beam_width}\n"
+        + ("=" * 20)
+    )
+
+    dataset = get_dataset(config)
+
     if config.smart_search:
-        print("Threshold:", config.threshold)
-    print("N:", config.n)
-    print("Beam width:", config.beam_width)
-    print("="*20)
-    
-    if config.smart_search:                
+        # ------------------------------------------------------------------
+        # SMART pipeline: SLM generates drafts; instructor LLM fixes low-
+        # confidence steps identified by the TLC scorer.
+        # ------------------------------------------------------------------
         mp.set_start_method("spawn", force=True)
+
         slm = LLM(
             model=config.draft_model_path,
             gpu_memory_utilization=config.gpu_memory_utilization,
@@ -102,34 +146,26 @@ def main():
             tensor_parallel_size=num_gpus,
             max_model_len=2048,
         )
-        
-        if config.model_path.startswith("groq:"):
-            from sal.utils.groq_client import GroqClient
-            model_name = config.model_path.split("groq:")[1]
-            if not model_name:
-                model_name = "llama-3.1-8b-instant"
-            llm = GroqClient(model=model_name)
-        else:
-            llm = AutoModelForCausalLM.from_pretrained(
-                config.model_path,
-                device_map="auto",
-                torch_dtype=torch.bfloat16,
-            ).eval()
-        
-        from sal.models.reward_models import ScorerRegistry
-        scorer = ScorerRegistry.get(config.score_method, config)
 
-        dataset = get_dataset(config)
+        # Instructor LLM: either a Groq API client or a local HF model.
+        if config.model_path.startswith("groq:"):
+            llm = _build_groq_llm(config.model_path)
+        else:
+            llm = _build_hf_llm(config.model_path)
+
         dataset = dataset.map(
             approach_fn,
             batched=True,
             batch_size=config.search_batch_size,
             fn_kwargs={"config": config, "slm": slm, "scorer": scorer, "llm": llm},
-            desc="Running search",
+            desc="Running SMART search",
             load_from_cache_file=False,
         )
 
     else:
+        # ------------------------------------------------------------------
+        # Baseline pipeline: single vLLM model, TLC scoring via logprobs.
+        # ------------------------------------------------------------------
         llm = LLM(
             model=config.model_path,
             revision="main",
@@ -139,54 +175,43 @@ def main():
             tensor_parallel_size=num_gpus,
             max_model_len=2048,
         )
-        
-        if config.score_method == 'prm':
-            prm = load_prm(config)
 
-            dataset = get_dataset(config)
-            dataset = dataset.map(
-                approach_fn,
-                batched=True,
-                batch_size=config.search_batch_size,
-                fn_kwargs={"config": config, "llm": llm, "prm": prm},
-                desc="Running search",
-                load_from_cache_file=False,
-            )
-        
-        elif config.score_method == 'conf':
-            prm = load_prm(config)
-            
-            dataset = get_dataset(config)
-            dataset = dataset.map(
-                approach_fn,
-                batched=True,
-                batch_size=config.search_batch_size,
-                fn_kwargs={"config": config, "llm": llm, "prm": prm},
-                desc="Running search",
-                load_from_cache_file=False,
-            )    
-        else: 
-            raise ValueError(f"Invalid score method: {config.score_method}")
+        dataset = dataset.map(
+            approach_fn,
+            batched=True,
+            batch_size=config.search_batch_size,
+            fn_kwargs={"config": config, "llm": llm, "scorer": scorer},
+            desc="Running baseline search",
+            load_from_cache_file=False,
+        )
 
+    # ------------------------------------------------------------------
+    # Post-processing: aggregate scores → evaluate → save
+    # ------------------------------------------------------------------
     dataset = score(dataset, config)
     save_dataset(dataset, config)
-    
+
     import sys
     sys.path.append("src/evaluation")
     from evaluation.evaluate import evaluate
-    if config.approach == "best_of_n" or config.approach == "beam_search":
-        subsets = [2**i for i in range(config.n) if 2**i <= config.n]
+
+    if config.approach in ("best_of_n", "beam_search"):
+        subsets = [2 ** i for i in range(config.n) if 2 ** i <= config.n]
         keys = []
         for n in subsets:
             keys.extend([f"pred_weighted@{n}", f"pred_maj@{n}", f"pred_naive@{n}"])
     else:
         keys = ["pred"]
-        
-    dataset, result = evaluate(data_name="math", prompt_type=None, samples=dataset, pred_keys=keys)
-    dataset = Dataset.from_list([{k: v for k, v in dict(sample).items() if k != 'pred_completions'} for sample in dataset])
-    
+
+    dataset, result = evaluate(
+        data_name="math", prompt_type=None, samples=dataset, pred_keys=keys
+    )
+    dataset = Dataset.from_list(
+        [{k: v for k, v in dict(sample).items() if k != "pred_completions"}
+         for sample in dataset]
+    )
+
     save_dataset(dataset, config)
-    
     logger.info(result)
     logger.info("Done 🔥!")
 

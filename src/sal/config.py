@@ -24,12 +24,14 @@ from sal.utils.hub import get_dataset_revisions
 @dataclass
 class Config:
     approach: Literal["best_of_n", "beam_search", "dvts"] = "best_of_n"
-    score_method: str = 'tlc' # 'conf'     # originally logprobs_base_score
+    # Scoring method. 'tlc' (Token-Level Confidence) is the primary method.
+    # Register additional methods in sal/models/reward_models.py via @ScorerRegistry.register.
+    score_method: str = 'tlc'
     smart_search: bool = False
     model_path: str = "meta-llama/Llama-3.2-1B-Instruct"
     draft_model_path: str = None
     gpu_memory_utilization: float = (
-        0.4  # vllm is allocated 0.5 of GPU memory, the PRM uses the rest
+        0.9  # fraction of GPU memory allocated to vLLM
     )
     scoring_threshold: float = 0.9
     threshold: float = 0.9
@@ -58,7 +60,7 @@ class Config:
     n: int = None
     temperature: float = 0.8
     top_p: float = 1.0
-    prm_batch_size: int = 4
+    # prm_batch_size removed — PRM scoring has been removed from the pipeline.
     search_batch_size: int = 25
     seed: int = 42
     max_tokens: int = 2048
